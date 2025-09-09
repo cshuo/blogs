@@ -1,6 +1,8 @@
+## Apache Hudi 1.1 前瞻：Flink 流式入湖的极致优化
+
 ### 背景
 
-随着实时数据处理的兴起，流式入湖已成为 Apache Hudi 的核心应用场景。Apache Flink 作为强大的流处理框架，已与 Hudi 实现无缝集成，支持将准实时数据高效写入 Hudi。虽然现有集成已提供强大而完备的能力，包括基于 Flink 检查点机制实现的 Exactly-Once 语义、灵活的写入模式以及丰富的索引功能，但当数据规模达到 PB 级别时，流式入湖的性能优化仍面临重大挑战，例如流处理作业的反压问题和高资源成本问题。影响流式入湖性能的因素涉及多个层面，比如 Flink 算子间的网络 shuffle 开销、Hudi Writer 内部的 Ser/De 成本，以及内存缓冲管理引发的 GC 问题。在 Hudi 1.1 版本中，我们通过精细的重构与优化解决了这些痛点，显著提升了 Flink 流式入湖的性能与稳定性。后续章节将重点介绍两项关键性能优化：
+随着实时数据处理的兴起，流式入湖已成为 Apache Hudi 的核心应用场景。Apache Flink 作为强大的流处理框架，已与 Hudi 实现无缝集成，支持将准实时数据高效写入 Hudi。虽然现有集成已提供强大而完备的能力，包括基于 Flink 检查点机制实现的 Exactly-Once 语义、灵活的写入模式以及丰富的索引功能，但当数据规模达到 PB 级别时，流式入湖的性能优化仍面临重大挑战，例如流处理作业的反压问题和高资源成本问题。影响流式入湖性能的因素涉及多个层面，比如 Flink 算子间的网络 shuffle 开销、Hudi Writer 内部的 Ser/De 成本，以及内存缓冲管理引发的 GC 问题。在 Hudi 1.1 版本中，我们通过精细的重构与优化解决了这些痛点，显著提升了 Flink 流式入湖的性能与稳定性。后续章节将重点介绍以下关键性能优化：
 
 * Flink 算子间的 Ser/De 开销优化
 
@@ -12,11 +14,11 @@
 
 ### Flink 算子间的 Ser/De 开销优化
 
-在 Hudi 1.1 版本之前，Avro 格式是 Flink 读写路径中的默认数据格式。这意味着写入 Pipeline 的首要步骤，就是将 Flink 的 RowData 转换为 Avro Record，随后才能构建 Hudi 内部的 HoodieRecord 对象进行后续写入处理。
+在 Hudi 1.1 版本之前，Avro 格式是 Flink 读写路径中的默认数据格式。这意味着写入 Pipeline 的首要步骤，就是将 Flink 的 `RowData` 转换为 Avro Record，随后才能构建 Hudi 内部的 `HoodieRecord` 对象进行后续写入处理。
 
 ![](images/image-7.png)
 
-当 Flink 任务存在多个算子且算子未被 Chain 一起时 (即未运行于同一JVM进程中)，数据则需先序列化为字节流才能通过网络 Shuffle 传输至下游算子。如果序列化执行得不够高效，仅 Shuffle 序列化这一环节就可能消耗大量资源。因此当你查看作业的 profiler 输出时，通常会发现序列化占据了 CPU 开销的前几位。
+当 Flink 任务存在多个算子且算子未被 Chain 一起时 (即未运行于同一 JVM 进程中)，数据则需先序列化为字节流才能通过网络 Shuffle 传输至下游算子。如果序列化执行得不够高效，仅 Shuffle 序列化这一环节就可能消耗大量资源。因此当你查看作业的 profiler 输出时，通常会发现序列化占据了 CPU 开销的前几位。
 
 Flink 本身提供了开箱即用的序列化框架，对基础类型（如原生数据类型和 Row 类型）内置了高效序列化器。但对于通用类型（例如 `HoodieRecord`），Flink 会回退使用基于 Kryo 的默认序列化器，其性能表现不尽如人意。
 
@@ -26,7 +28,7 @@ RFC-84 \[1] 提出了针对 Hudi 写入 Pipeline 中算子间 Ser/De 开销的�
 
 * `HoodieFlinkInternalRowTypeInfo`：针对 `HoodieFlinkInternalRow` 定制的 Flink 类型信息；
 
-* `HoodieFlinkInternalRowSerializer`：专为 `HoodieFlinkInternalRow` 设计的高效Flink类型序列化器；
+* `HoodieFlinkInternalRowSerializer`：专为 `HoodieFlinkInternalRow` 设计的高效 Flink 类型序列化器；
 
 ![](images/image-6.png)
 
@@ -38,7 +40,7 @@ RFC-84 \[1] 提出了针对 Hudi 写入 Pipeline 中算子间 Ser/De 开销的�
 
 ![](images/image-4.png)
 
-* 冗余的 Ser/De 开销 以写入 MOR 表为例，Flink 输入的数据格式是 RowData，首先会被转换为 Avro 的 `GenericRecord`，然后再序列化为 Avro 字节存入内部的 `HoodieAvroRecord`。在后续日志写入过程中，这些 `HoodieAvroRecord` 中的字节数据又被反序列化为 Avro 的 `IndexedRecord` 以便进行数据重写加工，然后才能追加到日志文件。显然以 Avro 作为中间数据表示，会引入显著的 Ser/De 序列化开销。
+* 冗余的 Ser/De 开销 以写入 MOR 表为例，Flink 输入的数据格式是 `RowData`，首先会被转换为 Avro 的 `GenericRecord`，然后再序列化为 Avro 字节存入内部的 `HoodieAvroRecord`。在后续日志写入过程中，这些 `HoodieAvroRecord` 中的字节数据又被反序列化为 Avro 的 `IndexedRecord` 以便进行数据重写加工，然后才能追加到日志文件。显然以 Avro 作为中间数据表示，会引入显著的 Ser/De 序列化开销。
 
 * 较大内存的消耗 Writer 内部的缓冲区是一个包含中间 Avro 对象的 Java List，这些对象会在数据刷盘后释放。在高吞吐的流式工作负载下，这些对象会显著增加堆内存的占用，加剧 GC 压力。
 
@@ -68,7 +70,7 @@ Mor 表的日志文件由数据块 (Log Block) 组成，在写入日志文件时
 
 ![](images/image-3.png)
 
-上一节中提到，日志文件默认使用的是 AVRO Block, Hudi 1.1 版本针对该类型 Block 的序列化也进行了细致优化，即消除了 Record 级别的字节拷贝开销（这个优化也包括在 1.0.2）。Hudi 1.1 版本前每条数据通过 AVRO Writer 写入到 `ByteArrayOutputStream` 中，而后通过 `toByteArray` 方法获取 byte 数组写入到外层Block 输出流中，而 `toByteArray` 方法底层会新创建 byte 数组，并将数据拷贝到新 byte 数组返回，且该字节拷贝是在 Record 级别进行的，在大流量场景会产生大量的临时对象，加剧 GC 压力。
+上一节中提到，日志文件默认使用的是 AVRO Block, Hudi 1.1 版本针对该类型 Block 的序列化也进行了细致优化，即消除了 Record 级别的字节拷贝开销（这个优化也包括在 1.0.2）。Hudi 1.1 版本前每条数据通过 AVRO Writer 写入到 `ByteArrayOutputStream` 中，而后通过 `toByteArray` 方法获取 byte 数组写入到外层 Block 输出流中，而 `toByteArray` 方法底层会新创建 byte 数组，并将数据拷贝到新 byte 数组返回，且该字节拷贝是在 Record 级别进行的，在大流量场景会产生大量的临时对象，加剧 GC 压力。
 
 ![](images/image-2.png)
 
